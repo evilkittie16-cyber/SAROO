@@ -165,6 +165,17 @@ module tsdram(
 
 	wire[1:0] sdtype = reg_sdram[11:10];
 
+	// [ABUS_EXP] Change 8b: BANK_MAP=1 takes the bank from the two address bits
+	// just below 16 MB (A23:A22; 8MB part: A22:A21), so each bank is one 4 MB
+	// region (2 MB on an 8 MB part) instead of switching every 2 KB. The SAROO
+	// menu code and its own data (0x000000-0x3FFFFF, CS0 0x22000000+) are then
+	// in bank 0, and the cover image the STM32 decodes while the menu runs
+	// (0x400000+, CS0 0x22400000+) in bank 1, so the cover writes are never in
+	// the bank of a code fetch. The column bits are unchanged; the row takes
+	// the remaining address bits. Both ports use the same map, so every address
+	// still has exactly one place in the SDRAM. BANK_MAP=0: the original map.
+	parameter BANK_MAP = 1;
+
 	function [12:0] f_col;
 		input [1:0] t; input [25:0] a;
 		f_col = (t==2'b11)? {3'b001,   a[10:1]} :
@@ -174,17 +185,26 @@ module tsdram(
 	endfunction
 	function [1:0] f_bank;
 		input [1:0] t; input [25:0] a;
-		f_bank = (t==2'b11)? a[12:11] :
-		         (t==2'b10)? a[11:10] :
-		         (t==2'b01)? a[11:10] :
-		                     a[10: 9] ;
+		if(BANK_MAP==0)
+			f_bank = (t==2'b11)? a[12:11] :
+			         (t==2'b10)? a[11:10] :
+			         (t==2'b01)? a[11:10] :
+			                     a[10: 9] ;
+		else
+			f_bank = (t==2'b00)? a[22:21] : a[23:22];
 	endfunction
 	function [12:0] f_row;
 		input [1:0] t; input [25:0] a;
-		f_row = (t==2'b11)? a[25:13] :
-		        (t==2'b10)? a[24:12] :
-		        (t==2'b01)? {1'b0, a[23:12]} :
-		                    {1'b0, a[22:11]} ;
+		if(BANK_MAP==0)
+			f_row = (t==2'b11)? a[25:13] :
+			        (t==2'b10)? a[24:12] :
+			        (t==2'b01)? {1'b0, a[23:12]} :
+			                    {1'b0, a[22:11]} ;
+		else
+			f_row = (t==2'b11)? {a[25:24], a[21:11]} :	// 64MB: 13 row bits
+			        (t==2'b10)? {a[24],    a[21:10]} :	// 32MB: 13
+			        (t==2'b01)? {1'b0,     a[21:10]} :	// 16MB: 12
+			                    {1'b0,     a[20: 9]} ;	//  8MB: 12
 	endfunction
 
 

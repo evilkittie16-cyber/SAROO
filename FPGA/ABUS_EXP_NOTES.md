@@ -521,8 +521,8 @@ Quartus 25.1 (build copy `quartus_build/ch8`, fitter SEED 3): 0 errors, same
 warnings as change 7. 1,825 LEs (29%), 996 registers. Worst setup slack
 +0.691ns (change 7: +0.167ns), inside the 100MHz domain +0.709ns, hold +0.166ns
 or more. Other seeds gave +0.18 to +0.49ns; without a SEED the STM32 FSMC ->
-cdcfifo path (unchanged logic) came out at -0.225ns, so SEED 3 is set in
-SSMaster.qsf. RBF SHA-256 CEADEEA572BECC4E2C93CB4086623298A3B82F7FABD06C08408104754D48C2B6.
+cdcfifo path (unchanged logic) came out at -0.225ns. (Superseded by the 8b
+build below: SEED 1.)
 
 Risk before flashing: the menu itself runs from the SDRAM through this
 controller, also at SAROO timing. If the new command sequences misbehave on
@@ -530,3 +530,55 @@ the real chip (commands to one bank during another bank's burst, back-to-back
 bursts, shorter DQM / write-data windows, all standard SDRAM operation but
 never used by the original design), the menu may not start, and the FPGA can
 then only be reflashed over JTAG.
+
+## Change 8b: one SDRAM bank per 4 MB (`tsdram.v` BANK_MAP=1), SIMULATION ONLY
+
+Hardware finding (2026-11-25, change 7 FPGA, Sega timing everywhere): with
+/SAROO/cover.bin renamed (no cover images) the menu does not freeze; with it,
+fast scrolling through the menu freezes it. So the trigger is the STM32's
+cover work while the menu runs from the cart: for each item it reads the cover
+index (SDRAM 0x4F0000), reads the image from cover.bin into 0x400C00, copies
+the palette to 0x400100, writes the header at 0x400004-0x40000E, and decodes
+animated GIF covers one byte at a time into 0x401000 + y*512 + x
+(saturn_utils.c, tinygif.c). All of it is SDRAM 0x400000-0x4FFFFF (CS0
+0x22400000+).
+
+The original address map switches bank every 2 KB, so the menu code
+(0x000000-0x07FFFF) and the cover buffer both cover all four banks, and cover
+writes keep landing in the bank of the next instruction fetch: the case change
+8 can't hide. BANK_MAP=1 takes the bank from A23:A22 (A22:A21 on an 8 MB part):
+each bank is one 4 MB region. Firmware, menu code and the SAROO's own data
+(0x000000-0x3FFFFF) are bank 0, the cover area and the 4 MB cart from
+0x400000 bank 1, the 8 MB above it banks 2-3. Column bits unchanged, the row
+takes the rest (64MB: {A25:A24, A21:A11}), so every address still has exactly
+one place; both ports use the same map. The SDRAM contents are lost at power
+off anyway, and the STM32 reloads everything (firmware, saves) at power-up.
+
+Testbench: AMAP=2 puts the Saturn's words where the firmware is (SDRAM
+0x000000-0x01FFFF). B_LOAD=4 = GIF decode (byte writes at 0x401000+, flag polls,
+3% file copies into 0x0C0000), B_LOAD=5 = fast scrolling (index reads, 8-48 KB
+image write, palette copy, header, next item 0.5-3 ms later). The model now
+keys its memory on all 13 row bits, and the testbench uses the DUT's map.
+
+Fast scrolling (Sega 0x2330, menu traffic, 3 seeds x 10 ms, ~33,000 reads):
+| | Change 7 | Change 8, old map | Change 8b |
+|---|---|---|---|
+| Saturn read errors | 25 / 24 / 32 | 3 / 2 / 1 | 1 / 0 / 1 |
+The errors left with 8b are both an owed SDRAM refresh that started in the
+clock the Saturn came back from a pause (the refresh slot after 640ns of CS0
+quiet). Change 7 has the same exposure, and on hardware Sega timing everywhere
+ran without freezes once cover.bin was renamed, so it is rare in practice.
+Other cases still exposed: STM32 writes into bank 0 itself while the menu runs
+(file reads into TMPBUFF 0x0C7000, the game list, saves), and Saturn reads of
+cover data in bank 1 while the STM32 writes the next cover (a wrong pixel, or
+a wrong cover header word).
+Regression with 8b: mixed / stress-test 5 / sequential traffic, SAROO 0x3880
+and 0x3440 timing with all STM32 loads (incl. menu + covers): 0 errors; STM32
+read data 0 errors; no SDRAM protocol errors or contention anywhere.
+
+Quartus 25.1 (quartus_build/ch8): seeds 1-5 gave -0.188 to +0.583ns; SEED 1 is
+set in SSMaster.qsf: worst setup +0.583ns (STM32 register read path), inside
+the 100MHz domain +0.978ns, hold +0.161ns or more. 1,825 LEs (29%), 996
+registers. RBF SHA-256
+2E980652FCFBCAC08A6CD6D8B575491A055C7539EBCD43F4C5BA539ABE6D8DA4
+(SAROO-release/test/SSMaster_change8_UNTESTED.rbf). Not flashed.

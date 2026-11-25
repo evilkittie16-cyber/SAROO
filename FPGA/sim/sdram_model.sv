@@ -46,7 +46,7 @@ module sdram_model(
 	endfunction
 
 	function automatic int index(logic [1:0] b, logic [12:0] row, logic [9:0] col);
-		return {b, row[9:0], col};
+		return {b, row, col};	// all 13 row bits (no aliasing between rows)
 	endfunction
 
 	function automatic logic [15:0] rd_word(int idx);

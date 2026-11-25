@@ -123,16 +123,23 @@ module tb;
 
 	// ---------------- address maps ----------------
 	// A (Saturn) test words w = 0..65535: bank 0, row {1, w[15:8], 0}, col w[7:0]
+	// SDRAM model index {bank, row, column} of a 26-bit byte address, with the DUT's bank map (64MB part)
+	function automatic int phys_index(logic [25:0] a);
+`ifdef CH8
+		if (u_hub._tsd.BANK_MAP != 0) return {a[23:22], a[25:24], a[21:11], a[10:1]};
+`endif
+		return {a[12:11], a[25:13], a[10:1]};
+	endfunction
+
 	// AMAP 1: A[16:13] = w[15:12] (row), A[12:11] = w[11:10] (bank), A[10:1] = w[9:0] (column)
+	// AMAP 2: the SAROO firmware's place: SDRAM 0x000000-0x01FFFF (CS0 0x22000000), A[16:1] = w
 	function automatic logic [23:0] a_bus_addr(logic [15:0] w);
 		if (AMAP == 1) return {2'b01, 5'b00000, w[15:12], w[11:10], w[9:0], 1'b0};
+		if (AMAP == 2) return {7'b0000000, w, 1'b0};
 		return {2'b01, w[15:8], 5'b00000, w[7:0], 1'b0};
 	endfunction
-	// SDRAM model index {bank, row[9:0], col} = {A[12:11], A[22:13], A[10:1]}
 	function automatic int a_index(logic [15:0] w);
-		logic [23:0] a;
-		a = a_bus_addr(w);
-		return {a[12:11], a[22:13], a[10:1]};
+		return phys_index({2'b00, a_bus_addr(w)});
 	endfunction
 	function automatic logic [15:0] swap(logic [15:0] v);
 		return {v[7:0], v[15:8]};
@@ -255,20 +262,27 @@ module tb;
 	int  st_ops = 0, st_rd_n = 0, st_rd_err = 0;
 	logic [15:0] st_shadow [int];	// STM32 area: what each word should hold
 	function automatic int b_index(logic [25:0] a);
-		return {a[12:11], a[22:13], a[10:1]};
+		return phys_index(a);
 	endfunction
 	real st_wait_max = 0, st_wait_sum = 0;
-	task automatic st_access(bit wr, logic [25:0] a, logic [15:0] d);
+	// mask: 1 = that byte is not written (as the FSMC byte lanes); 2'b00 = whole word
+	task automatic st_access(bit wr, logic [25:0] a, logic [15:0] d, logic [1:0] mask = 2'b00);
 		realtime t0;
 		real tw;
 		@(posedge clk);
 		t0 = $realtime;
-		st_cs <= 1; st_addr <= a; st_din <= d; st_mask <= 2'b00;
+		st_cs <= 1; st_addr <= a; st_din <= d; st_mask <= wr ? mask : 2'b00;
 		if (wr) st_wr <= 1; else st_rd <= 1;
 		@(posedge clk); st_wr <= 0; st_rd <= 0;
 		@(posedge clk);
 		while (st_wait == 0) @(posedge clk);
-		if (wr) st_shadow[b_index(a)] = d;
+		if (wr) begin
+			logic [15:0] o;
+			o = st_shadow.exists(b_index(a)) ? st_shadow[b_index(a)] : u_sdram.init_val(b_index(a));
+			if (!mask[1]) o[15:8] = d[15:8];
+			if (!mask[0]) o[7:0]  = d[7:0];
+			st_shadow[b_index(a)] = o;
+		end
 		else begin
 			logic [15:0] e;
 			e = st_shadow.exists(b_index(a)) ? st_shadow[b_index(a)] : u_sdram.init_val(b_index(a));
@@ -287,7 +301,45 @@ module tb;
 		bit wr;
 		wait (reset);
 		wait (`POR_DONE);
-		if (B_LOAD > 0) forever begin
+		if (B_LOAD == 5) forever begin
+			// Fast scrolling through the menu (saturn_utils.c): for each new item the STM32 reads the cover
+			// index at 0x4F0000, reads the cover image from cover.bin into 0x400C00 (back-to-back writes, as
+			// fast as the SD card and FSMC allow), copies its 1 KB palette to 0x400100 (read + write), writes
+			// the header words at 0x400004-0x40000E, then the next item comes 0.5-3 ms later.
+			logic [25:0] a;
+			int unsigned n;
+			for (int i = 0; i < 8; i++) st_access(0, 26'h04F0000 + 26'($urandom_range(2047, 0) * 2), 16'h0);
+			n = $urandom_range(24576, 4096);	// 8-48 KB image
+			for (int i = 0; i < n; i++) begin
+				repeat ($urandom_range(4, 0)) @(posedge clk);
+				st_access(1, 26'h0400C00 + 26'(i * 2), 16'($urandom));
+			end
+			for (int i = 0; i < 512; i++) begin
+				st_access(0, 26'h0400C00 + 26'(i * 2), 16'h0);
+				st_access(1, 26'h0400100 + 26'(i * 2), 16'($urandom));
+			end
+			for (int i = 0; i < 6; i++) st_access(1, 26'h0400004 + 26'(i * 2), 16'($urandom));
+			#($urandom_range(3000000, 500000));
+		end else if (B_LOAD == 4) forever begin
+			// SAROO menu cover decode (tinygif.c): the STM32 writes the image one pixel (byte) at a time
+			// into SDRAM 0x401000 + y*512 + x (CS0 0x22401000), every 3-20 clocks of decoding, polls the
+			// flag at 0x400000 between frames, and now and then copies a file into 0x0C0000-0x0FFFFF
+			// (TMPBUFF-like area, same 4 MB as the firmware).
+			for (int y = 0; y < 192; y++) begin
+				for (int x = 0; x < 128; x++) begin
+					logic [25:0] a;
+					a = 26'h0401000 + 26'(y * 512 + x);
+					repeat ($urandom_range(20, 3)) @(posedge clk);
+					st_access(1, {a[25:1], 1'b0}, {2{8'($urandom)}}, a[0] ? 2'b01 : 2'b10);	// even address: low byte
+				end
+				if ((y % 48) == 47) st_access(0, 26'h0400000, 16'h0);	// poll the frame flag
+				if (($urandom % 100) < 3) begin	// file read into the low area
+					base = 26'h00C0000 + 26'($urandom_range(32767, 0) * 2);
+					run = $urandom_range(256, 32);
+					for (int i = 0; i < run; i++) st_access(1, base + 26'(i * 2), 16'($urandom));
+				end
+			end
+		end else if (B_LOAD > 0) forever begin
 			gap = (B_LOAD == 1) ? $urandom_range(400, 40) : (B_LOAD == 3) ? $urandom_range(200, 0) : $urandom_range(6, 0);
 			repeat (gap) @(posedge clk);
 			run = (B_LOAD == 3) ? $urandom_range(256, 32) : $urandom_range(16, 1);
