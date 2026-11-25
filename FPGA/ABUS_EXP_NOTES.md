@@ -582,3 +582,81 @@ the 100MHz domain +0.978ns, hold +0.161ns or more. 1,825 LEs (29%), 996
 registers. RBF SHA-256
 2E980652FCFBCAC08A6CD6D8B575491A055C7539EBCD43F4C5BA539ABE6D8DA4
 (SAROO-release/test/SSMaster_change8_UNTESTED.rbf). Not flashed.
+## Change 9: mirrored SDRAM, a Saturn read never waits (`tsdram.v`, `memhub.v`, `cachebus.v`), SIMULATION ONLY
+
+Goal: make the collision impossible instead of rare. Change 8b still let a
+Saturn read meet a busy bank: an STM32 access in the same bank, or a refresh
+(all banks).
+
+How (MIRROR=1, 64MB SDRAM):
+- Every word is stored twice: copy 0 in bank B (A23:A22, as 8b), rows
+  0-4095; copy 1 in bank B^1, rows 4096-8191. Writes go to both copies, a
+  read takes a copy whose bank is free. Logical memory is 32 MB: the
+  Saturn's whole window with AA24 and STM32 pages 0-1 (the MCU firmware only
+  ever selects pages 0-1; pages 2-3 would show pages 0-1 again).
+- Background work (STM32 accesses, refresh) uses one bank at a time: a new
+  background ACT waits until the last background bank has finished its
+  precharge. So at most one bank is busy with background work, and one of
+  the two banks holding any Saturn word is always free.
+- Refresh per bank: ACTIVATE + PRECHARGE of each row of each bank in turn,
+  4 bank-rows per 7.81us = all 32768 every 64ms. AUTO REFRESH only at
+  power-up. tRAS (ACT->PRE >= 5 clocks) and tRP (2) respected.
+- Saturn commands first; what can still delay a Saturn read is one
+  command-bus clock and, after an STM32 READ, the 4-clock burst spacing.
+- Saturn write: acknowledged after the first copy, second copy as soon as
+  its bank is free (no background work starts until then; a Saturn read of
+  that word takes the copy already written).
+- STM32 write: acknowledged after both copies. If the Saturn writes the same
+  word in between, the Saturn's value wins: the STM32's second copy is
+  skipped if not started, and the ack carries t_noupd so cachebus doesn't
+  put the STM32's older value into the line caches (new cachebus input
+  ack_noupd; Saturn port tied to 0).
+- No STM32 gating needed (stm_ok = 1 when mirrored); the Saturn refresh
+  cycle (FC1) is no longer used.
+- MIRROR=0 or a smaller SDRAM: single copy, the rest the same (then a Saturn
+  read can meet a busy bank, as in change 8).
+
+Testbench: model checks tRAS on PRECHARGE, keys memory on all 13 row bits,
+reads unwritten words the same in both copies, and compares both copies of
+every written word at the end (STM32 stopped first). Reports bank-rows
+refreshed vs needed. The STM32 test area moved below 32 MB (A24=1).
+New TRAFFIC=4 + B_LOAD=6: Saturn and STM32 on the same 16 words (word and
+byte writes, reads, Saturn read-back after its writes); at the end both
+sides read every word, the second Saturn read from the FPGA line cache, and
+everything must agree with the SDRAM and both copies.
+
+Results (Sega 0x2330 unless noted, Saturn read errors):
+| Pattern | Change 7 | 8b | 9 |
+|---|---|---|---|
+| menu + heavy STM32, 3 seeds x 10 ms | 66/60/68 (AMAP1) | - | 0/0/0 |
+| menu + SD copy, 3 x 10 ms | 70/80/71 (AMAP1) | - | 0/0/0 |
+| menu + GIF decode, 3 x 10 ms | - | 2/1/1 | 0/0/0 |
+| menu + fast-scroll cover loads, 3 x 10 ms | 25/24/32 | 1/0/1 | 0/0/0 |
+| mixed / stress-test 5 / sequential, all STM32 loads, bursty | 0-11 | 0-1 | 0 |
+| SAROO 0x3880 and 0x3440 timing, all patterns | 0 | 0 | 0 |
+| shared-word race, 4 seeds, Sega and SAROO timing | - | 0 | 0 |
+Worst Saturn read in any run: 110ns (SCU samples at 139.7ns); change 7
+reached 137-139ns under STM32 load. STM32 read data always correct, both
+copies identical at the end of every run, refresh rate met (e.g. 5132
+bank-rows in 10 ms, 5132 needed), no SDRAM protocol errors or contention.
+STM32 worst wait 790ns (change 7: 2.2us, from the change 5 gating).
+Race test: the Saturn overwrote a word the STM32 was writing 69-82 times per
+run (second copy skipped 51-63 times), all consistent. The guard for a Saturn
+read of a word whose second copy is pending never triggered: the read-back
+is answered from the FPGA line cache, and the second copy is done before
+another access could evict it.
+
+Quartus 25.1 (quartus_build/ch8): seeds 1-6 all met timing (+0.024 to
++0.367ns); SEED 1: worst setup +0.367ns (STM32 register read path,
+unchanged logic), inside the 100MHz domain +0.469ns (Saturn address ->
+copy choice -> SDRAM command), hold +0.149ns or more. 2,152 LEs (34%), 1,196
+registers. RBF SHA-256
+62F294140420E0FD21A22BDDDDFF8B83DC7B8CCB05E6E1906E7C796EA8771CC5
+(SAROO-release/test/SSMaster_change9_UNTESTED.rbf). Not flashed.
+
+New on the real chip compared with every earlier image (all standard SDR
+SDRAM operations, checked by the model, never used by the original design):
+single-bank PRECHARGE for refresh instead of AUTO REFRESH, commands to one
+bank while another bank bursts, back-to-back bursts, shorter DQM and
+write-data windows. The menu runs from this SDRAM even at SAROO timing, so a
+problem here could stop the menu (recovery: JTAG).

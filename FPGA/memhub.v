@@ -70,6 +70,7 @@ module memhub(
 	wire cmd_ack_a, cmd_ack_b;
 	wire data_valid_a, data_valid_b;
 	wire t_acc;
+	wire t_noupd;		// [ABUS_EXP] Change 9
 
 
 ///////////////////////////////////////////////////////
@@ -98,7 +99,7 @@ module memhub(
 		cmd_req_a, cmd_ack_a, cache_invalid_a, cache_update_a,
 		cache_addr_a, cache_data1d_a, cache_valid_a,
 		mask_a, req_addr_a, req_wdata_a, req_mask_a, hit_a,
-		data_valid_a, cmd_dout	// [ABUS_EXP] Change 6a: fill data straight to the bus
+		data_valid_a, cmd_dout, 1'b0	// [ABUS_EXP] Change 6a: fill data straight to the bus
 	);
 
 	cacheblk _cha(reset, clk,
@@ -121,7 +122,7 @@ module memhub(
 		cmd_req_b, cmd_ack_b, cache_invalid_b, cache_update_b,
 		cache_addr_b, cache_data1d_b, cache_valid_b,
 		mask_b, req_addr_b, req_wdata_b, req_mask_b, hit_b,
-		data_valid_b, cmd_dout
+		data_valid_b, cmd_dout, t_noupd
 	);
 
 	cacheblk _chb(reset, clk,
@@ -163,7 +164,7 @@ module memhub(
 		reset, clk, reg_sdram,
 		ext_refresh, cs_a, (rd_a | wr_a), hit_a, stm_ok,
 		cmd_req_a, req_addr_a, req_wdata_a, req_mask_a, cmd_ack_a, data_valid_a,
-		cmd_req_b, b_go, req_addr_b, req_wdata_b, req_mask_b, cmd_ack_b, data_valid_b, t_acc,
+		cmd_req_b, b_go, req_addr_b, req_wdata_b, req_mask_b, cmd_ack_b, t_noupd, data_valid_b, t_acc,
 		cmd_dout,
 		sd_cke, sd_cs, sd_ras, sd_cas, sd_we, sd_addr, sd_ba, sd_dqm, sd_data, sd_dout, sd_oe
 	);

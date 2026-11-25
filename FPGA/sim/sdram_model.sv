@@ -24,6 +24,8 @@ module sdram_model(
 	parameter real T_WR  = 14.9;
 	parameter real T_RFC = 60.0;
 	parameter real T_RRD = 14.9;	// ACT to ACT, different banks
+	parameter real T_RAS = 42.0;	// ACT to PRECHARGE, same bank
+	bit mirror_init = 0;	// change 9: unwritten words read the same in both copies (copy 1 = bank^1, row bit 12 set)
 	realtime last_act = -1e9, burst_end = -1e9;
 
 	logic [15:0] mem [int];
@@ -49,8 +51,22 @@ module sdram_model(
 		return {b, row, col};	// all 13 row bits (no aliasing between rows)
 	endfunction
 
+	function automatic int canon(int idx);	// copy 1 -> copy 0
+		if (mirror_init && idx[22]) return {idx[24:23] ^ 2'b01, 1'b0, idx[21:0]};
+		return idx;
+	endfunction
 	function automatic logic [15:0] rd_word(int idx);
-		return mem.exists(idx) ? mem[idx] : init_val(idx);
+		return mem.exists(idx) ? mem[idx] : init_val(canon(idx));
+	endfunction
+	// change 9: both copies of every written word must hold the same value
+	function automatic int mirror_mismatch();
+		int n = 0;
+		foreach (mem[i]) begin
+			int j;
+			j = i[22] ? {i[24:23] ^ 2'b01, 1'b0, i[21:0]} : {i[24:23] ^ 2'b01, 1'b1, i[21:0]};
+			if (rd_word(i) !== rd_word(j)) begin n++; if (n <= 5) $display("MIRROR MISMATCH idx %07h = %04h, other copy %07h = %04h", i, rd_word(i), j, rd_word(j)); end
+		end
+		return n;
 	endfunction
 
 	task automatic err(string s);
@@ -127,6 +143,7 @@ module sdram_model(
 			if (a[10]) begin row_open[ba] = 0; bank_ready[ba] = t + T_WR + T_RP; end
 		end
 		3'b010: begin	// PRECHARGE
+			for (int i = 0; i < 4; i++) if ((a[10] || ba == i) && row_open[i] && t - act_time[i] < T_RAS) err($sformatf("PRECHARGE bank %0d %.1fns after ACT (tRAS)", i, t - act_time[i]));
 			for (int i = 0; i < 4; i++) if (a[10] || ba == i) begin row_open[i] = 0; bank_ready[i] = t + T_RP; end
 		end
 		3'b001: begin	// AUTO REFRESH

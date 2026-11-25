@@ -125,7 +125,10 @@ module tb;
 	// A (Saturn) test words w = 0..65535: bank 0, row {1, w[15:8], 0}, col w[7:0]
 	// SDRAM model index {bank, row, column} of a 26-bit byte address, with the DUT's bank map (64MB part)
 	function automatic int phys_index(logic [25:0] a);
-`ifdef CH8
+`ifdef CH9
+		if (u_hub._tsd.mirror) return {a[23:22], 1'b0, a[24], a[21:11], a[10:1]};	// copy 0
+		return {a[23:22], a[25:24], a[21:11], a[10:1]};
+`elsif CH8
 		if (u_hub._tsd.BANK_MAP != 0) return {a[23:22], a[25:24], a[21:11], a[10:1]};
 `endif
 		return {a[12:11], a[25:13], a[10:1]};
@@ -145,10 +148,14 @@ module tb;
 		return {v[7:0], v[15:8]};
 	endfunction
 
+`ifdef CH9
+	initial u_sdram.mirror_init = 1;	// before the shadow copy below reads init values
+`endif
 	logic [15:0] shadow [65536];
 	initial for (int w = 0; w < 65536; w++) shadow[w] = swap(u_sdram.init_val(a_index(w[15:0])));
 
 	// ---------------- statistics ----------------
+	bit final_chk = 0;
 	int n_rd = 0, n_wr = 0, n_err = 0, n_late = 0, lat_n = 0;
 	real lat_max = 0, lat_sum = 0;
 	logic        rd_active = 0, lat_done = 0;
@@ -168,7 +175,9 @@ module tb;
 `ifdef CH8
 			bank_busy_at_start = !u_hub._tsd.bank_free[SS_ADDR[12:11]];
 `endif
-`ifdef CH8
+`ifdef CH9
+			st_busy_at_start = u_hub._tsd.bg_open || (u_hub._tsd.bank_open != 0) || (u_hub.cmd_req_b != 0);
+`elsif CH8
 			st_busy_at_start = u_hub._tsd.t_open || (u_hub._tsd.bank_open != 0) || (u_hub.cmd_req_b != 0);
 `else
 			st_busy_at_start = (u_hub.state != 0 && u_hub.act_ab == 1) || (u_hub.cmd_req_b != 0);
@@ -180,7 +189,9 @@ module tb;
 	string   ref_why = "?", why_d = "?";
 	realtime ref_t = -1e9;
 	always @(posedge clk) begin
+`ifndef CH9
 		if (u_hub._tsd.ref_ack) begin ref_t = $realtime; ref_why = why_d; end
+`endif
 `ifdef HAS_REF_DEBT
 		// flags as the scheduler saw them on the clock that decided
 		why_d = $sformatf("ext=%0d after_sat=%0d in_hit=%0d quiet=%0d force=%0d debt=%0d",
@@ -195,6 +206,16 @@ module tb;
 		lat_done = 1; lat_n++; lat_sum += l;
 		if (l > lat_max) lat_max = l;
 	end
+
+`ifdef CH9
+	// how often the rare change-9 paths ran (shared-word race test)
+	int c_skip = 0, c_sat = 0, c_s2m = 0;
+	always @(posedge clk) begin
+		if (u_hub._tsd.pick == 0 && u_hub._tsd.go_tw_skip) c_skip++;
+		if (u_hub._tsd.pick == 2 && u_hub._tsd.s_match) c_s2m++;
+		if (u_hub._tsd.pick == 2 && u_hub._tsd.mirror && u_hub._tsd.s_req != 2'b10 && u_hub._tsd.tw_active && u_hub._tsd.s_addr[24:1] == u_hub._tsd.t_wa) c_sat++;
+	end
+`endif
 
 	// ---------------- SCU master ----------------
 	task automatic scu_access(bit wr, logic [15:0] w, logic [15:0] wd);
@@ -230,7 +251,7 @@ module tb;
 		end else begin
 			n_rd++; rd_active = 0;
 			if (!lat_done) n_late++;
-			if (smp !== rd_expect) begin
+			if ((TRAFFIC != 4 || final_chk) && smp !== rd_expect) begin
 				n_err++;
 				if (smp === prev_smp) e_stale++;	// the value of the previous read: answered too late
 				if (!saw_start)                                  e_nostart++;
@@ -266,9 +287,11 @@ module tb;
 	endfunction
 	real st_wait_max = 0, st_wait_sum = 0;
 	// mask: 1 = that byte is not written (as the FSMC byte lanes); 2'b00 = whole word
+	bit st_stop = 0;	// set at the end: no new STM32 accesses, so the copies can be compared
 	task automatic st_access(bit wr, logic [25:0] a, logic [15:0] d, logic [1:0] mask = 2'b00);
 		realtime t0;
 		real tw;
+		wait (!st_stop);
 		@(posedge clk);
 		t0 = $realtime;
 		st_cs <= 1; st_addr <= a; st_din <= d; st_mask <= wr ? mask : 2'b00;
@@ -295,13 +318,41 @@ module tb;
 		if (tw > st_wait_max) st_wait_max = tw;
 	endtask
 
+	task automatic st_access_nc(bit wr, logic [25:0] a, logic [15:0] d, logic [1:0] mask);
+		wait (!st_stop);
+		@(posedge clk);
+		st_cs <= 1; st_addr <= a; st_din <= d; st_mask <= wr ? mask : 2'b00;
+		if (wr) st_wr <= 1; else st_rd <= 1;
+		@(posedge clk); st_wr <= 0; st_rd <= 0;
+		@(posedge clk);
+		while (st_wait == 0) @(posedge clk);
+		@(posedge clk); st_cs <= 0;
+		st_ops++;
+	endtask
+	task automatic st_read_now(logic [25:0] a, output logic [15:0] v);
+		@(posedge clk);
+		st_cs <= 1; st_addr <= a; st_rd <= 1;
+		@(posedge clk); st_rd <= 0;
+		@(posedge clk);
+		while (st_wait == 0) @(posedge clk);
+		v = st_dout;
+		@(posedge clk); st_cs <= 0;
+	endtask
+
 	initial begin : stm32
 		int unsigned gap, run;
 		logic [25:0] base;
 		bit wr;
 		wait (reset);
 		wait (`POR_DONE);
-		if (B_LOAD == 5) forever begin
+		if (B_LOAD == 6) forever begin
+			// both sides on the same 16 words (TRAFFIC 4): random writes (word and byte) and reads
+			logic [25:0] a;
+			a = 26'h0000200 + 26'($urandom_range(15, 0) * 2);
+			repeat ($urandom_range(12, 0)) @(posedge clk);
+			if ($urandom % 2) st_access_nc(1, a, 16'($urandom), 2'($urandom_range(2, 0)));
+			else               st_access_nc(0, a, 16'h0, 2'b00);
+		end else if (B_LOAD == 5) forever begin
 			// Fast scrolling through the menu (saturn_utils.c): for each new item the STM32 reads the cover
 			// index at 0x4F0000, reads the cover image from cover.bin into 0x400C00 (back-to-back writes, as
 			// fast as the SD card and FSMC allow), copies its 1 KB palette to 0x400100 (read + write), writes
@@ -345,7 +396,8 @@ module tb;
 			run = (B_LOAD == 3) ? $urandom_range(256, 32) : $urandom_range(16, 1);
 			wr  = (B_LOAD == 3) ? (($urandom % 8) != 0) : (($urandom % 4) != 0);	// mostly writes, like sector fills
 			// B area: row[9] = 0, so it never overlaps the Saturn test words
-			base = {1'b1, 2'b00, 1'b0, 9'($urandom), 2'($urandom), 10'($urandom), 1'b0};
+			// A24 = 1 (16-32 MB): below 32 MB, so the mirrored design doesn't fold it onto the Saturn's words
+			base = {1'b0, 1'b1, 1'b0, 1'b0, 9'($urandom), 2'($urandom), 10'($urandom), 1'b0};
 			for (int i = 0; i < run; i++) st_access(wr, base + 26'(i * 2), 16'($urandom));
 		end
 	end
@@ -378,6 +430,18 @@ module tb;
 				// Like RAMCART-Stress test 3 (verify): sequential 32-bit reads
 				scu_access(0, w, 16'h0); scu_access(0, w + 1, 16'h0);
 				w = w + 2;
+			end else if (TRAFFIC == 4) begin
+				w = 16'h0100 + 16'($urandom_range(15, 0));
+				if ($urandom % 2) begin
+					logic [15:0] v;
+					v = 16'($urandom);
+					scu_access(1, w, v);
+					if ($urandom % 2) begin	// read it straight back: must see v unless the STM32 wrote it meanwhile
+						shadow[w] = v;
+						scu_access(0, w, 16'h0);
+					end
+				end else scu_access(0, w, 16'h0);
+				repeat ($urandom % 3) @(posedge sclk);
 			end else if (TRAFFIC == 3) begin
 				int unsigned k;
 				#($urandom_range(30000, 1000));			// loop in the SH-2 cache
@@ -403,10 +467,40 @@ module tb;
 			end
 			if (($urandom % 100) < SAT_IDLE_PCT) #($urandom_range(3000, 500));	// Saturn busy elsewhere
 		end
+		st_stop = 1;
 		#2000;
+		if (TRAFFIC == 4) begin	// both sides idle: everyone must now see the same value
+			int bad = 0, sat_bad;
+			n_err = 0; final_chk = 1;	// the Saturn reads below are checked
+			for (int i = 0; i < 16; i++) begin
+				logic [15:0] ww, sv, m0, m1;
+				int i0, i1;
+				ww = 16'h0100 + 16'(i);
+				i0 = a_index(ww);
+				i1 = {i0[24:23] ^ 2'b01, 1'b1, i0[21:0]};	// copy 1 (mirrored design)
+				m0 = u_sdram.rd_word(i0);
+				m1 = u_sdram.rd_word(i1);
+				shadow[ww] = swap(m0);
+				scu_access(0, ww, 16'h0);	// twice: the second read comes from the FPGA line cache
+				scu_access(0, ww, 16'h0);
+				st_read_now({2'b00, a_bus_addr(ww)}, sv);
+				if (sv !== m0) begin bad++; $display("SHARED w=%04h STM32 reads %04h, SDRAM %04h", ww, sv, m0); end
+`ifdef CH9
+				if (u_hub._tsd.mirror && m0 !== m1) begin bad++; $display("SHARED w=%04h copies %04h / %04h", ww, m0, m1); end
+`endif
+			end
+			sat_bad = n_err;
+			$display("SHARED %s | after the race: Saturn reads wrong %0d, STM32 reads or copies wrong %0d", NAME, sat_bad, bad);
+`ifdef CH9
+			$display("SHARED %s | Saturn wrote a word the STM32 was writing: %0d (second copy skipped %0d) | Saturn read a word whose second copy was pending: %0d", NAME, c_sat, c_skip, c_s2m);
+`endif
+		end
 		$display("STM32 %s | accesses %0d | reads %0d READ ERRORS %0d | wait avg %.0f max %.0f ns", NAME, st_ops, st_rd_n, st_rd_err,
 			(st_ops ? st_wait_sum / st_ops : 0.0), st_wait_max);
 		$display("STALE %s | errors that returned the previous read's value: %0d of %0d", NAME, e_stale, n_err);
+`ifdef CH9
+		$display("MIRROR %s | mirrored %0d | copies differing %0d | bank-rows refreshed %0d (needed %0d for this time)", NAME, u_hub._tsd.mirror, u_sdram.mirror_mismatch(), u_hub._tsd.rr_done, int'(($realtime - 200000.0) / 1953.1));
+`endif
 		$display("CAUSES %s | read start missed %0d | cachebus still busy %0d | internal refresh %0d | Saturn-refresh refresh %0d | STM32 in progress %0d (same bank %0d) | other (too slow) %0d",
 			NAME, e_nostart, e_busy, e_ref, e_ref_ext, e_st, e_st_same, e_other);
 		$display("RESULT %s NW=%0d EWT=%0d B_LOAD=%0d | reads %0d writes %0d | READ ERRORS %0d | late %0d | read latency avg %.1f max %.1f ns (SCU samples at %.1f) | SDRAM errors %0d contention %0d | refs %0d max gap %.2f us | sdram rd %0d wr %0d",

@@ -9,7 +9,7 @@ module cachebus(
 	cmd_req, cmd_ack, cache_invalid, cache_update,
 	cache_addr, cache_data_1d, cache_valid,
 	mask, req_addr, req_wdata, req_mask, hit,
-	fill_valid, fill_data
+	fill_valid, fill_data, ack_noupd
 );
 
 ///////////////////////////////////////////////////////
@@ -48,6 +48,7 @@ module cachebus(
 	output hit;		// [ABUS_EXP] Change 4: one-clock pulse, read served from the line cache
 	input fill_valid;	// [ABUS_EXP] Change 6a: a word of this port's line fill is on fill_data now
 	input[15:0] fill_data;
+	input ack_noupd;	// [ABUS_EXP] Change 9: with cmd_ack of a write: don't update the line caches (a newer write won)
 
 
 ///////////////////////////////////////////////////////
@@ -109,7 +110,7 @@ module cachebus(
 		if(reset==0)
 			cache_update <= 0;
 		else
-			cache_update <= (state==B_WRITE && cmd_ack);
+			cache_update <= (state==B_WRITE && cmd_ack && !ack_noupd);
 	end
 
 	always @(negedge reset or posedge clk)
