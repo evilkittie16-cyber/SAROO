@@ -11,14 +11,14 @@ $env:PATH = "$ms;$env:PATH"
 $sim = $PSScriptRoot
 Push-Location $sim
 try {
-    $src = @{ orig = "$sim\orig"; new = (Split-Path $sim); v123 = "$sim\v123" }
+    $src = @{ orig = "$sim\orig"; new = (Split-Path $sim); v123 = "$sim\v123"; c7 = "$sim\c7" }
     foreach ($d in $Designs) {
         $lib = "work_$d"
         if (-not (Test-Path $lib)) { & vlib $lib | Out-Null }
         $rtl = 'tsdram.v', 'cacheblk.v', 'cachebus.v', 'memhub.v' | ForEach-Object { Join-Path $src[$d] $_ }
         $out = & vlog -work $lib -timescale 1ns/1ps @rtl 2>&1
         if ($LASTEXITCODE -ne 0) { $out; throw "vlog RTL failed ($d)" }
-        $defs = @(); if ($d -eq 'new') { $defs = @('+define+HAS_REF_DEBT') }
+        $defs = @(); if ($d -eq 'new') { $defs = @('+define+HAS_REF_DEBT', '+define+CH8') } elseif ($d -eq 'c7') { $defs = @('+define+HAS_REF_DEBT') }
         $out = & vlog -work $lib -sv @defs "$sim\sdram_model.sv" "$sim\tb_memhub.sv" 2>&1
         if ($LASTEXITCODE -ne 0) { $out; throw "vlog TB failed ($d)" }
     }

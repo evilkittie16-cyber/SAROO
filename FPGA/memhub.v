@@ -60,20 +60,16 @@ module memhub(
 	wire[25:3] cache_addr_b;
 	wire[63:0] cache_data1d_b;
 	wire[ 3:0] cache_valid_b;
-	reg[1:0] state;
-	reg[ 1:0] cmd_req;
-	reg[ 1:0] cmd_mask;
-	reg[25:0] cmd_addr;
-	reg[15:0] cmd_din;
-	reg act_ab;
-	reg data_ab;
-	reg cmd_ack_a;
-	reg cmd_ack_b;
-	wire cmd_ack;
-	wire data_valid;
 	wire[15:0] cmd_dout;
 	wire[15:0] sd_dout;
 	wire sd_oe;
+
+	// [ABUS_EXP] Change 8: the request manager that was here (one request at
+	// a time, Saturn first) is gone. Each bus has its own request port on
+	// tsdram, which overlaps them across SDRAM banks (see tsdram.v).
+	wire cmd_ack_a, cmd_ack_b;
+	wire data_valid_a, data_valid_b;
+	wire t_acc;
 
 
 ///////////////////////////////////////////////////////
@@ -102,10 +98,8 @@ module memhub(
 		cmd_req_a, cmd_ack_a, cache_invalid_a, cache_update_a,
 		cache_addr_a, cache_data1d_a, cache_valid_a,
 		mask_a, req_addr_a, req_wdata_a, req_mask_a, hit_a,
-		(data_valid && !data_ab), cmd_dout	// [ABUS_EXP] Change 6a: fill data straight to the bus
+		data_valid_a, cmd_dout	// [ABUS_EXP] Change 6a: fill data straight to the bus
 	);
-
-	wire data_valid_a = (data_valid==1 && data_ab==0);
 
 	cacheblk _cha(reset, clk,
 		cache_addr_a, cache_data1d_a, cache_valid_a, data_valid_a, cmd_dout,
@@ -127,11 +121,8 @@ module memhub(
 		cmd_req_b, cmd_ack_b, cache_invalid_b, cache_update_b,
 		cache_addr_b, cache_data1d_b, cache_valid_b,
 		mask_b, req_addr_b, req_wdata_b, req_mask_b, hit_b,
-		(data_valid && data_ab), cmd_dout
+		data_valid_b, cmd_dout
 	);
-
-
-	wire data_valid_b = (data_valid==1 && data_ab==1);
 
 	cacheblk _chb(reset, clk,
 		cache_addr_b, cache_data1d_b, cache_valid_b, data_valid_b, cmd_dout,
@@ -142,15 +133,11 @@ module memhub(
 
 
 ///////////////////////////////////////////////////////
-// request manager                                   //
+// [ABUS_EXP] Change 5: STM32 gate                    //
 ///////////////////////////////////////////////////////
+// STM32 requests start only when tsdram says it is safe (stm_ok), or after
+// waiting STM_MAX_WAIT clocks so they can't starve.
 
-
-
-	localparam C_IDLE=0, C_WAITACK=1, C_END=2;
-
-	// [ABUS_EXP] Change 5: STM32 requests start only when tsdram says it is
-	// safe (stm_ok), or after waiting STM_MAX_WAIT clocks so they can't starve.
 	parameter  STM_GATE     = 1;		// 0: Change 5 off (for comparison)
 	localparam STM_MAX_WAIT = 8'd200;	// 2us
 	reg[7:0] b_wait;
@@ -161,70 +148,10 @@ module memhub(
 	begin
 		if(reset==0)
 			b_wait <= 0;
-		else if(cmd_req_b==0 || (state==C_IDLE && !cmd_req_a && b_go))
+		else if(cmd_req_b==0 || t_acc)
 			b_wait <= 0;
 		else if(!b_force)
 			b_wait <= b_wait+1'b1;
-	end
-
-	always @(negedge reset or posedge clk)
-	begin
-		if(reset==0) begin
-			state <= C_IDLE;
-			cmd_req <= 0;
-		end else begin
-			case(state)
-			C_IDLE: begin
-				// [ABUS_EXP] Change 2: reads keep the word address (was 3'b0), so
-				// the SDRAM burst starts at the requested word.
-				// Change 3: captured req_* values instead of the live bus.
-				if(cmd_req_a) begin
-					act_ab <= 1'b0;
-					cmd_req <= cmd_req_a;
-					cmd_mask <= req_mask_a;
-					cmd_addr <= req_addr_a;
-					cmd_din <= req_wdata_a;
-					state <= C_WAITACK;
-				end else if(cmd_req_b && b_go) begin	// [ABUS_EXP] Change 5: was if(cmd_req_b)
-					act_ab <= 1'b1;
-					cmd_req <= cmd_req_b;
-					cmd_mask <= req_mask_b;
-					cmd_addr <= req_addr_b;
-					cmd_din <= req_wdata_b;
-					state <= C_WAITACK;
-				end
-			end
-
-			C_WAITACK: begin
-				// [ABUS_EXP] Change 7: follow the write data/mask that cachebus is still sampling, until
-				// tsdram takes them (m_dout <= cmd_din in M_WRITE)
-				if(act_ab==0) begin
-					cmd_din  <= req_wdata_a;
-					cmd_mask <= req_mask_a;
-				end else begin
-					cmd_din  <= req_wdata_b;
-					cmd_mask <= req_mask_b;
-				end
-				if(cmd_ack) begin
-					cmd_ack_a <= (act_ab==0);
-					cmd_ack_b <= (act_ab==1);
-					data_ab <= act_ab;
-					cmd_req <= 0;
-					state <= C_END;
-				end
-			end
-
-			C_END: begin
-				cmd_ack_a <= 0;
-				cmd_ack_b <= 0;
-				state <= C_IDLE;
-			end
-
-			default: begin
-				state <= C_IDLE;
-			end
-			endcase
-		end
 	end
 
 
@@ -232,10 +159,12 @@ module memhub(
 // sdram controller                                  //
 ///////////////////////////////////////////////////////
 
-
 	tsdram _tsd(
 		reset, clk, reg_sdram,
-		ext_refresh, cmd_req, ~act_ab, cs_a, hit_a, stm_ok, cmd_ack, cmd_mask, cmd_addr, cmd_din, cmd_dout, data_valid,	// [ABUS_EXP] ~act_ab = cmd_prio (Saturn), cs_a = Saturn CS0, hit_a = Saturn cache hit
+		ext_refresh, cs_a, (rd_a | wr_a), hit_a, stm_ok,
+		cmd_req_a, req_addr_a, req_wdata_a, req_mask_a, cmd_ack_a, data_valid_a,
+		cmd_req_b, b_go, req_addr_b, req_wdata_b, req_mask_b, cmd_ack_b, data_valid_b, t_acc,
+		cmd_dout,
 		sd_cke, sd_cs, sd_ras, sd_cas, sd_we, sd_addr, sd_ba, sd_dqm, sd_data, sd_dout, sd_oe
 	);
 

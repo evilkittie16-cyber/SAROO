@@ -460,3 +460,73 @@ SOAK 1.4 (2026-11-25, ~2 h 15 min): RAMCART-Stress 1.4, all 12 tests, Sega timin
 0x23301FF0, CD load on: runs passed 100 of 100, ALL RUNS 0, CD loads 30,329
 data OK, code self-test OK. Covers the 4 MB cart, code fetch from the cart, the
 8 MB above it and the AA24 16 MB, ~4,900 frames per run.
+
+## Change 8: two request ports and bank overlap (`tsdram.v`, `memhub.v`), SIMULATION ONLY
+
+Not flashed or run on hardware. Built 2026-11-25 to attack the menu freeze at
+Sega timing (CS0 at 3 waits, external WAIT off, see the CS1 test above).
+
+Cause (reproduced in simulation): the SAROO menu waits in loops that run from
+the SH-2 cache (`while(SS_CMD);`), so CS0 is idle for microseconds and Change 5
+lets the STM32 use the SDRAM freely while it copies from the SD card. The
+Saturn's next instruction fetch then meets an STM32 access in progress: memhub
+handled one request at a time, so the Saturn waited for the whole STM32 access
+(ACT, READ/WRITE, precharge, up to ~9 clocks) and the answer came too late.
+
+What changed:
+- memhub's request manager is gone. The Saturn (S) and the STM32 (T) each
+  have a request port on tsdram, and tsdram keeps a slot per port with
+  per-bank timers. One command per clock: Saturn READ/WRITE, Saturn ACT, STM32
+  READ/WRITE (an STM32 READ only when no Saturn access waits, unless the
+  Saturn needs the STM32's bank), refresh (all banks idle), STM32 ACT (not
+  while a Saturn access waits or starts, not while an FC1 refresh or an owed
+  refresh with its quiet slot waits).
+- So a Saturn access to another bank goes in between an STM32 access already
+  under way: 1-2 clocks late instead of up to 9. In the same bank it still
+  waits for the STM32 access to finish (that case is what is left).
+- Timing rules unchanged where they existed (tRCD 2, Saturn write 4,
+  READA->ACT 7, WRITEA->ACT 5, REF->ACT 9). New: ACT->ACT 2 (tRRD), READ->READ
+  4 (no burst cut short), READ->WRITE 7. DQM is held low 4 clocks from a READ
+  (was: until idle), the data bus is driven only on the WRITE clock (was:
+  until idle), so a READ in another bank can follow at once.
+- The Saturn request goes to tsdram directly (one register less), so the
+  fastest Sega-timing read drops from 110 to 100ns in the model.
+- The STM32 address decode is registered (one clock more for the STM32 only)
+  to keep the 100MHz paths short.
+- Tried and dropped: keeping the STM32 out of the bank of the Saturn's last
+  access. A streaming STM32 has to write that bank anyway; after its 2us wait
+  it is forced through at a random moment, which made it worse.
+
+Testbench additions (`sim/`): `TRAFFIC=3` (menu: 1-30us in the SH-2 cache,
+then bursts of 8-word cache-line fills), `B_LOAD=3` (SD card copy: runs of up
+to 256 back-to-back writes), `AMAP=1` (Saturn words spread over all four banks
+like real code), a check of the STM32's read data, and SDRAM model checks for
+tRRD, overlapping bursts, writes during read data and read data masked by DQM.
+The model now also keeps DQ driven across back-to-back bursts. `sim/c7` holds
+change 7 for comparison (`run.ps1 -Designs c7,new`).
+
+Results (Sega 0x2330, menu pattern, AMAP=1, Saturn read errors):
+| STM32 load | Change 7 | Change 8 |
+|---|---|---|
+| heavy, 3 seeds x 10 ms (~33,000 reads each) | 66 / 60 / 68 | 3 / 4 / 4 |
+| SD copy, 3 seeds x 10 ms | 70 / 80 / 71 | 1 / 2 / 3 |
+What is left: an STM32 access already in the bank the Saturn needs, and the
+odd refresh. Other patterns (mixed, stress-test 5, sequential; none / light /
+heavy STM32; bursty): change 8 equal to or better than change 7 everywhere.
+SAROO 0x3880 and 0x3440 timing: 0 errors, worst read under heavy STM32 load
+169ns (change 7: 190ns), STM32 accesses ~20% faster. STM32 read data: 0 errors
+in every run. No SDRAM protocol errors or bus contention in any run.
+
+Quartus 25.1 (build copy `quartus_build/ch8`, fitter SEED 3): 0 errors, same
+warnings as change 7. 1,825 LEs (29%), 996 registers. Worst setup slack
++0.691ns (change 7: +0.167ns), inside the 100MHz domain +0.709ns, hold +0.166ns
+or more. Other seeds gave +0.18 to +0.49ns; without a SEED the STM32 FSMC ->
+cdcfifo path (unchanged logic) came out at -0.225ns, so SEED 3 is set in
+SSMaster.qsf. RBF SHA-256 CEADEEA572BECC4E2C93CB4086623298A3B82F7FABD06C08408104754D48C2B6.
+
+Risk before flashing: the menu itself runs from the SDRAM through this
+controller, also at SAROO timing. If the new command sequences misbehave on
+the real chip (commands to one bank during another bank's burst, back-to-back
+bursts, shorter DQM / write-data windows, all standard SDRAM operation but
+never used by the original design), the menu may not start, and the FPGA can
+then only be reflashed over JTAG.

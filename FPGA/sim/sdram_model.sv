@@ -23,6 +23,8 @@ module sdram_model(
 	parameter real T_RP  = 19.9;
 	parameter real T_WR  = 14.9;
 	parameter real T_RFC = 60.0;
+	parameter real T_RRD = 14.9;	// ACT to ACT, different banks
+	realtime last_act = -1e9, burst_end = -1e9;
 
 	logic [15:0] mem [int];
 	logic [12:0] open_row [4];
@@ -60,8 +62,22 @@ module sdram_model(
 		for (int i = 0; i < 4; i++) begin row_open[i] = 0; bank_ready[i] = 0; act_time[i] = 0; end
 	end
 
+	// DQM has a read latency of 2: the DQM present at clock READ+k masks burst word k (output at READ+k+2).
+	// The FPGA changes DQM half a clock after the SDRAM clock edge, so 1ns after an edge it shows that edge's value.
+	task automatic check_dqm();
+		for (int k = 0; k < BL; k++) begin
+			#((k == 0) ? 1.0 : TCK);
+			if (dqm !== 2'b00) err($sformatf("read word %0d masked by DQM", k));
+		end
+	endtask
+
 	// one burst output process per READ
+	// A burst that starts as the previous one ends (READs BL clocks apart) keeps DQ driven: only the
+	// newest burst turns the outputs off.
+	int burst_id = 0;
 	task automatic do_burst(int b, logic [12:0] row, logic [9:0] col);
+		int my_id;
+		my_id = ++burst_id;
 		for (int k = 0; k < BL; k++) begin
 			logic [9:0] c;
 			c = {col[9:2], col[1:0] + k[1:0]};
@@ -70,7 +86,7 @@ module sdram_model(
 			dq_oe = 1;
 		end
 		#(TCK);
-		dq_oe = 0;
+		if (my_id == burst_id) dq_oe = 0;
 	endtask
 
 	always @(posedge clk) if (cke && !cs_n) begin
@@ -81,13 +97,17 @@ module sdram_model(
 			if (row_open[ba]) err($sformatf("ACT to open bank %0d", ba));
 			if (t < bank_ready[ba]) err($sformatf("ACT bank %0d %.1fns early (tRP/tWR)", ba, bank_ready[ba] - t));
 			if (seen_ref && t - last_ref < T_RFC) err($sformatf("ACT %.1fns after REF (tRFC)", t - last_ref));
-			row_open[ba] = 1; open_row[ba] = a; act_time[ba] = t;
+			if (t - last_act < T_RRD) err($sformatf("ACT %.1fns after the last ACT (tRRD)", t - last_act));
+			row_open[ba] = 1; open_row[ba] = a; act_time[ba] = t; last_act = t;
 		end
 		3'b101: begin	// READ
 			if (!row_open[ba]) err($sformatf("READ to closed bank %0d", ba));
 			else if (t - act_time[ba] < T_RCD) err($sformatf("READ %.1fns after ACT (tRCD)", t - act_time[ba]));
 			reads++;
-			fork do_burst(ba, open_row[ba], a[9:0]); join_none
+			// this design never interrupts a burst: a READ whose data would overlap the last burst is an error
+			if (t < burst_end) err($sformatf("READ %.1fns before the last burst ends (burst overlap)", burst_end - t));
+			burst_end = t + BL * TCK;
+			fork do_burst(ba, open_row[ba], a[9:0]); check_dqm(); join_none
 			if (a[10]) begin row_open[ba] = 0; bank_ready[ba] = t + BL * TCK + T_RP; end
 		end
 		3'b100: begin	// WRITE (single location)
@@ -96,6 +116,8 @@ module sdram_model(
 			if (!row_open[ba]) err($sformatf("WRITE to closed bank %0d", ba));
 			else if (t - act_time[ba] < T_RCD) err($sformatf("WRITE %.1fns after ACT (tRCD)", t - act_time[ba]));
 			if (dq_oe) err("WRITE while SDRAM drives DQ");
+			// read data is on DQ from READ+CL to READ+CL+BL; a WRITE drives DQ on its own clock
+			if (t > burst_end - 2 * TCK && t < burst_end + 2.5 * TCK) err("WRITE during a read burst's data");
 			writes++;
 			idx = index(ba, open_row[ba], a[9:0]);
 			w = rd_word(idx);

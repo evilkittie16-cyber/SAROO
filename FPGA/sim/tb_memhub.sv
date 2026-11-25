@@ -17,6 +17,12 @@
 //   B_LOAD         STM32 traffic: 0 none, 1 light, 2 heavy
 //   SIM_US         simulated time after SDRAM init, in microseconds
 //   SEED           random seed
+`ifdef CH8
+ `define POR_DONE (u_hub._tsd.in_por == 0)
+`else
+ `define POR_DONE (u_hub._tsd.m_state == 1)
+`endif
+
 module tb;
 	parameter int NW     = 8;
 	parameter int EWT    = 1;
@@ -30,6 +36,13 @@ module tb;
 	parameter real WDATA_DELAY = 0.0;	// ns after the start of a write cycle until the new data is valid at the FPGA
 	parameter int SEED   = 1;
 	parameter string NAME = "run";
+	// AMAP 0: Saturn test words all in SDRAM bank 0 (original testbench).
+	// AMAP 1: like real code: 1024 words (2 KB) per bank, then the next bank, as tsdram maps addresses.
+	parameter int AMAP   = 0;
+	// TRAFFIC 3 (SAROO menu): the Saturn waits 1-30us in a loop that runs from the SH-2 cache (no cart
+	// access), then runs from the cart: bursts of SH-2 cache-line fills (8 sequential 16-bit reads),
+	// mostly the next line, sometimes a jump. B_LOAD 3: the STM32 copies from the SD card into the
+	// SDRAM: runs of up to 256 sequential writes, back to back.
 
 	localparam real TSCU = 34.92;
 
@@ -110,11 +123,16 @@ module tb;
 
 	// ---------------- address maps ----------------
 	// A (Saturn) test words w = 0..65535: bank 0, row {1, w[15:8], 0}, col w[7:0]
+	// AMAP 1: A[16:13] = w[15:12] (row), A[12:11] = w[11:10] (bank), A[10:1] = w[9:0] (column)
 	function automatic logic [23:0] a_bus_addr(logic [15:0] w);
+		if (AMAP == 1) return {2'b01, 5'b00000, w[15:12], w[11:10], w[9:0], 1'b0};
 		return {2'b01, w[15:8], 5'b00000, w[7:0], 1'b0};
 	endfunction
+	// SDRAM model index {bank, row[9:0], col} = {A[12:11], A[22:13], A[10:1]}
 	function automatic int a_index(logic [15:0] w);
-		return {2'b00, 1'b1, w[15:8], 1'b0, 2'b00, w[7:0]};
+		logic [23:0] a;
+		a = a_bus_addr(w);
+		return {a[12:11], a[22:13], a[10:1]};
 	endfunction
 	function automatic logic [15:0] swap(logic [15:0] v);
 		return {v[7:0], v[15:8]};
@@ -132,14 +150,22 @@ module tb;
 	real         budget;
 
 	// error classification: what was going on when the read started
-	bit busy_at_start, saw_start, st_busy_at_start;
+	bit busy_at_start, saw_start, st_busy_at_start, bank_busy_at_start;
+	int e_st_same = 0;	// CH8: STM32 errors where the Saturn's bank itself was busy at the start
 	int e_busy = 0, e_nostart = 0, e_ref = 0, e_ref_ext = 0, e_st = 0, e_other = 0, e_stale = 0;
 	logic [15:0] prev_smp = 16'hxxxx;
 	always @(posedge clk) begin
 		if (ss_rd_start && rd_active) begin
 			saw_start = 1;
 			busy_at_start = (u_hub.busa.state != 0);
+`ifdef CH8
+			bank_busy_at_start = !u_hub._tsd.bank_free[SS_ADDR[12:11]];
+`endif
+`ifdef CH8
+			st_busy_at_start = u_hub._tsd.t_open || (u_hub._tsd.bank_open != 0) || (u_hub.cmd_req_b != 0);
+`else
 			st_busy_at_start = (u_hub.state != 0 && u_hub.act_ab == 1) || (u_hub.cmd_req_b != 0);
+`endif
 		end
 	end
 
@@ -205,7 +231,7 @@ module tb;
 				else if ($realtime - u_sdram.last_ref < 250.0) begin
 					if ($realtime - last_ext < 400.0) e_ref_ext++; else e_ref++;
 				end
-				else if (st_busy_at_start)                       e_st++;
+				else if (st_busy_at_start) begin e_st++; if (bank_busy_at_start) e_st_same++; end
 				else                                             e_other++;
 				if (n_err <= 8) $display("%t READ ERROR w=%04h got %04h expected %04h | last refresh %.0fns before read start (%s)",
 					$realtime, w, smp, rd_expect, rd_t0 - ref_t, ref_why);
@@ -226,7 +252,11 @@ module tb;
 	endtask
 
 	// ---------------- STM32 master ----------------
-	int  st_ops = 0;
+	int  st_ops = 0, st_rd_n = 0, st_rd_err = 0;
+	logic [15:0] st_shadow [int];	// STM32 area: what each word should hold
+	function automatic int b_index(logic [25:0] a);
+		return {a[12:11], a[22:13], a[10:1]};
+	endfunction
 	real st_wait_max = 0, st_wait_sum = 0;
 	task automatic st_access(bit wr, logic [25:0] a, logic [15:0] d);
 		realtime t0;
@@ -238,6 +268,13 @@ module tb;
 		@(posedge clk); st_wr <= 0; st_rd <= 0;
 		@(posedge clk);
 		while (st_wait == 0) @(posedge clk);
+		if (wr) st_shadow[b_index(a)] = d;
+		else begin
+			logic [15:0] e;
+			e = st_shadow.exists(b_index(a)) ? st_shadow[b_index(a)] : u_sdram.init_val(b_index(a));
+			st_rd_n++;
+			if (st_dout !== e) begin st_rd_err++; if (st_rd_err <= 5) $display("%t STM32 READ ERROR a=%07h got %04h expected %04h", $realtime, a, st_dout, e); end
+		end
 		@(posedge clk); st_cs <= 0;
 		tw = $realtime - t0;
 		st_ops++; st_wait_sum += tw;
@@ -249,12 +286,12 @@ module tb;
 		logic [25:0] base;
 		bit wr;
 		wait (reset);
-		wait (u_hub._tsd.m_state == 1);
+		wait (`POR_DONE);
 		if (B_LOAD > 0) forever begin
-			gap = (B_LOAD == 1) ? $urandom_range(400, 40) : $urandom_range(6, 0);
+			gap = (B_LOAD == 1) ? $urandom_range(400, 40) : (B_LOAD == 3) ? $urandom_range(200, 0) : $urandom_range(6, 0);
 			repeat (gap) @(posedge clk);
-			run = $urandom_range(16, 1);
-			wr  = ($urandom % 4) != 0;			// mostly writes, like sector fills
+			run = (B_LOAD == 3) ? $urandom_range(256, 32) : $urandom_range(16, 1);
+			wr  = (B_LOAD == 3) ? (($urandom % 8) != 0) : (($urandom % 4) != 0);	// mostly writes, like sector fills
 			// B area: row[9] = 0, so it never overlaps the Saturn test words
 			base = {1'b1, 2'b00, 1'b0, 9'($urandom), 2'($urandom), 10'($urandom), 1'b0};
 			for (int i = 0; i < run; i++) st_access(wr, base + 26'(i * 2), 16'($urandom));
@@ -269,7 +306,7 @@ module tb;
 		void'($urandom(SEED));
 		budget = (NW + 1) * TSCU;
 		wait (reset);
-		wait (u_hub._tsd.m_state == 1);		// SDRAM power-on sequence done
+		wait (`POR_DONE);		// SDRAM power-on sequence done
 		#1000;
 		w = 16'($urandom);
 		next_ref = $realtime + 15000.0;
@@ -289,6 +326,20 @@ module tb;
 				// Like RAMCART-Stress test 3 (verify): sequential 32-bit reads
 				scu_access(0, w, 16'h0); scu_access(0, w + 1, 16'h0);
 				w = w + 2;
+			end else if (TRAFFIC == 3) begin
+				int unsigned k;
+				#($urandom_range(30000, 1000));			// loop in the SH-2 cache
+				w = (($urandom % 4) == 0) ? 16'($urandom) & 16'hFFF8 : (w & 16'hFFF8) + 16'd8;
+				k = $urandom_range(40, 1);
+				for (int i = 0; i < k; i++) begin
+					if ($realtime >= next_ref) begin scu_refresh(); next_ref += 15000.0; end
+					for (int j = 0; j < 8; j++) scu_access(0, w + 16'(j), 16'h0);	// one cache-line fill
+					r = $urandom % 100;
+					if (r < 75)      w = w + 16'd8;		// next line
+					else if (r < 90) w = (w + 16'($urandom_range(256, 0) * 8)) & 16'hFFF8;	// near jump
+					else             w = 16'($urandom) & 16'hFFF8;	// far jump
+					if (($urandom % 100) < 10) scu_access(1, 16'($urandom), 16'($urandom));	// data write
+				end
 			end else begin
 			r = $urandom % 100;
 			if (r < 55)      w = w + 1;			// sequential
@@ -301,11 +352,11 @@ module tb;
 			if (($urandom % 100) < SAT_IDLE_PCT) #($urandom_range(3000, 500));	// Saturn busy elsewhere
 		end
 		#2000;
-		$display("STM32 %s | accesses %0d | wait avg %.0f max %.0f ns", NAME, st_ops,
+		$display("STM32 %s | accesses %0d | reads %0d READ ERRORS %0d | wait avg %.0f max %.0f ns", NAME, st_ops, st_rd_n, st_rd_err,
 			(st_ops ? st_wait_sum / st_ops : 0.0), st_wait_max);
 		$display("STALE %s | errors that returned the previous read's value: %0d of %0d", NAME, e_stale, n_err);
-		$display("CAUSES %s | read start missed %0d | cachebus still busy %0d | internal refresh %0d | Saturn-refresh refresh %0d | STM32 in progress %0d | other (too slow) %0d",
-			NAME, e_nostart, e_busy, e_ref, e_ref_ext, e_st, e_other);
+		$display("CAUSES %s | read start missed %0d | cachebus still busy %0d | internal refresh %0d | Saturn-refresh refresh %0d | STM32 in progress %0d (same bank %0d) | other (too slow) %0d",
+			NAME, e_nostart, e_busy, e_ref, e_ref_ext, e_st, e_st_same, e_other);
 		$display("RESULT %s NW=%0d EWT=%0d B_LOAD=%0d | reads %0d writes %0d | READ ERRORS %0d | late %0d | read latency avg %.1f max %.1f ns (SCU samples at %.1f) | SDRAM errors %0d contention %0d | refs %0d max gap %.2f us | sdram rd %0d wr %0d",
 			NAME, NW, EWT, B_LOAD, n_rd, n_wr, n_err, n_late, (lat_n ? lat_sum / lat_n : 0.0), lat_max, budget,
 			u_sdram.errors, contention, u_sdram.refs, u_sdram.max_ref_gap / 1000.0, u_sdram.reads, u_sdram.writes);
